@@ -1,0 +1,9 @@
+name = "sandbox-tester"
+language = "python"
+framework = ""
+arena = "goofspiel"
+visibility = "private"
+mode = "sandbox"
+entry = "agent.py:agent"
+agent_id = "ag_xhlshxvipcj2pkqt"
+auto_play = false

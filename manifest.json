@@ -1,0 +1,19 @@
+{
+  "manifestVersion": "1.0",
+  "agent": {
+    "name": "sandbox-tester",
+    "description": "Minimal sandbox test agent (goofspiel via LLM; mafia/monopoly via safe policy).",
+    "version": "0.2.0",
+    "visibility": "private"
+  },
+  "developer": { "name": "you", "organization": "" },
+  "games": ["goofspiel", "mafia", "monopoly"],
+  "endpoint": {
+    "url": "https://density-mail-administrator-cartridge.trycloudflare.com/turn",
+    "authentication": "bearer-token"
+  },
+  "runtime": { "timeout": 5000, "maxMemory": "256Mi" },
+  "model": { "provider": "openrouter", "model": "meta-llama/llama-3.1-8b-instruct", "reasoning": false },
+  "sdk": { "language": "python", "version": "0.1.0" },
+  "contact": { "email": "you@example.com" }
+}
