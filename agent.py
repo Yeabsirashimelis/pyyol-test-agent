@@ -2,13 +2,13 @@
 """Minimal Pyyol sandbox test agent — plays all 3 games, cheap on tokens.
 
 Purpose: the sandbox smoke test Nahom asked for — ONE agent, given an API key,
-that joins and finishes a match in every game (goofspiel, mafia, monopoly). It is
+that joins and finishes a match in every game (goofspiel, mafia). It is
 deliberately minimal: it is here to prove the *pipeline* works, not to win.
 
 How it decides:
   * goofspiel — the LLM picks the card (this is the game the model board compares,
     so we exercise the real model path here). Prompt is tiny; reply is one number.
-  * mafia / monopoly — a safe built-in policy picks a legal move. No model call, so
+  * mafia — the LLM writes the line and picks the target; a safe built-in policy
     these cost nothing and never stall the match. (Extending the LLM to these games
     is a later step, once the smoke test is green.)
 
@@ -17,7 +17,7 @@ Runs over the SDK's outbound WebSocket — no public URL / ngrok needed:
     export OPENROUTER_API_KEY=sk-or-...        # your OpenRouter key
     pyyol login                                # once, opens the browser
     pyyol dev                                  # practice (SANDBOX, no stakes)
-    pyyol play goofspiel                       # or: mafia / monopoly  (still SANDBOX)
+    pyyol play goofspiel                       # or: mafia            (still SANDBOX)
 """
 
 import os
@@ -31,8 +31,6 @@ from pyyol.models import (
     GoofspielView,
     MafiaMove,
     MafiaView,
-    MonopolyMove,
-    MonopolyView,
 )
 
 # Capture model / tokens / cost for every LLM call automatically.
@@ -56,6 +54,26 @@ def _llm():
             OpenAI(
                 base_url="https://openrouter.ai/api/v1",
                 api_key=os.environ.get("OPENROUTER_API_KEY", "") or "missing-key",
+                # An agent must never block longer than its own turn.
+                #
+                # The SDK's default is 600 seconds with 2 retries, so a single hung
+                # request can hold the agent for the better part of half an hour. The
+                # arena's shot clock is 60 seconds: it stops waiting, plays a default
+                # for the seat, and moves on — but the agent is still blocked, so it
+                # misses every turn after that too, not just the one that hung.
+                #
+                # Watched it happen: a Monopoly agent answered 80 turns cleanly, then
+                # went dark mid-match. The arena kept dealing it turns and burning the
+                # full 60s timeout on each, one round stretched to four minutes, and
+                # the match never finished. From the log it looked like the ARENA had
+                # gone quiet; the agent had.
+                #
+                # Well under the shot clock on purpose. A model that has not answered
+                # in this long has already lost the turn, so waiting further buys
+                # nothing — failing over to another model, or to the rules-based
+                # policy, is strictly better than silence.
+                timeout=20.0,
+                max_retries=1,
             )
         )
     return _client
@@ -128,7 +146,6 @@ MAX_TOKENS = 256
 # told not to -- and with a marker, the prose is harmless instead of fatal.
 ANSWER_MARK = "ANSWER:"
 
-
 def _final_int(reply: str) -> int | None:
     """The number the model actually chose.
 
@@ -197,15 +214,13 @@ def _ask(system: str, user: str, max_tokens: int = MAX_TOKENS) -> str | None:
 
 class MinimalAgent(Adapter):
     name = "sandbox-tester"
-    supported_games = ["goofspiel", "mafia", "monopoly"]
+    supported_games = ["goofspiel", "mafia"]
 
     def step(self, view):
         if isinstance(view, GoofspielView):
             return self._goofspiel(view)
         if isinstance(view, MafiaView):
             return self._mafia(view)
-        if isinstance(view, MonopolyView):
-            return self._monopoly(view)
         # Unknown view — should not happen; do nothing rather than crash.
         return None
 
@@ -335,104 +350,6 @@ class MinimalAgent(Adapter):
                 return seat
         return view.your_seat
 
-    # ── Monopoly: the LLM decides, but only when there is a decision ─────────────
-    #
-    # Most monopoly "turns" are not choices. `roll`, `end_turn` and `done` have one
-    # sensible answer and no strategic content, and a match runs to 150+ of them. Asking
-    # a model each time would add minutes of latency, cost a fortune in tokens, and
-    # measure nothing -- so those go straight through the rules.
-    #
-    # The model is asked only where the game is actually won or lost: whether to buy,
-    # whether to bid, and whether to accept a trade. That is also the honest thing to
-    # benchmark, because it is where two models would genuinely differ.
-    _MONOPOLY_SYSTEM = (
-        "You are playing Monopoly. You win by owning colour groups and building on "
-        "them, and by not going bankrupt. Property is usually worth buying early; "
-        "cash matters most when rent is high. Trades that complete somebody else's "
-        "colour group are usually bad for you.\n"
-        "Think briefly, then end with the action, exactly like:\n"
-        f"{ANSWER_MARK} buy"
-    )
-
-    # Actions with no strategic content. Taken without asking anybody.
-    _MECHANICAL = ("roll", "end_turn", "done", "roll_jail")
-
-    def _monopoly(self, view: MonopolyView) -> MonopolyMove:
-        legal = view.legal_actions
-        if not legal:
-            return MonopolyMove(action="")
-
-        # A real decision is one where at least two genuinely different options exist.
-        choices = [a for a in legal if a not in self._MECHANICAL]
-        if len(choices) >= 2 or (len(choices) == 1 and len(legal) >= 2):
-            picked = self._monopoly_choice(view, legal)
-            if picked:
-                if picked == "bid":
-                    return MonopolyMove(action="bid", amount=self._min_bid(view))
-                if picked in ("mortgage", "sell_house"):
-                    prop = self._first_holding(view)
-                    if prop is not None:
-                        return MonopolyMove(action=picked, property=prop)
-                    # No property to act on; fall through to the rules below.
-                else:
-                    return MonopolyMove(action=picked)
-
-        return self._monopoly_policy(view)
-
-    def _monopoly_choice(self, view: MonopolyView, legal: list) -> str | None:
-        state = (
-            f"Legal actions: {list(legal)}. "
-            f"Your cash: {(view.state or {}).get('cash', 'unknown')}. "
-            f"Board state: {str(view.state)[:600]}"
-        )
-        reply = _ask(self._MONOPOLY_SYSTEM, state)
-        if not reply:
-            return None
-        picked = _final_choice(reply, [str(a) for a in legal])
-        if picked is None:
-            print(f"[LLM] monopoly gave no legal action: {reply[:120]!r}", flush=True)
-        return picked
-
-    # The original rules, kept as the fallback for every path above. A model outage
-    # must never mean an illegal move or a stalled turn.
-    def _monopoly_policy(self, view: MonopolyView) -> MonopolyMove:
-        legal = view.legal_actions
-        if not legal:
-            return MonopolyMove(action="")
-        if "buy" in legal:
-            return MonopolyMove(action="buy")
-        if "bid" in legal:
-            return MonopolyMove(action="bid", amount=self._min_bid(view))
-        if "pass" in legal:
-            return MonopolyMove(action="pass")
-        if "mortgage" in legal:  # raise cash before ever going bankrupt
-            prop = self._first_holding(view)
-            if prop is not None:
-                return MonopolyMove(action="mortgage", property=prop)
-        if "sell_house" in legal:
-            prop = self._first_holding(view)
-            if prop is not None:
-                return MonopolyMove(action="sell_house", property=prop)
-        for a in ("pay_jail", "use_jail_card", "roll_jail"):
-            if a in legal:
-                return MonopolyMove(action=a)
-        if "reject_trade" in legal:
-            return MonopolyMove(action="reject_trade")
-        for a in ("roll", "end_turn", "done"):  # keep the turn moving
-            if a in legal:
-                return MonopolyMove(action=a)
-        return MonopolyMove(action=legal[0])  # best-effort: any legal action
-
-    def _min_bid(self, view: MonopolyView) -> int:
-        auction = (view.state or {}).get("auction") or {}
-        return int(auction.get("min_bid", auction.get("current", 0) + 1) or 1)
-
-    def _first_holding(self, view: MonopolyView):
-        me = str(view.state.get("seat", view.state.get("your_seat", "")))
-        for p in (view.state or {}).get("properties", []) or []:
-            if str(p.get("owner", "")) == me and not p.get("mortgaged", False):
-                return p.get("id", p.get("name"))
-        return None
 
 
 agent = MinimalAgent()  # pyyol.toml -> entry = "agent.py:agent"
